@@ -1943,6 +1943,52 @@ class TestX509Store:
         store.add_cert(cert)
         store.add_cert(cert)
 
+    def test_set_time_aware_datetime(self) -> None:
+        """
+        `X509Store.set_time` converts a timezone-aware ``datetime`` to UTC
+        instead of interpreting its clock face as UTC.
+        """
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        name = x509.Name(
+            [x509.NameAttribute(x509.NameOID.COMMON_NAME, "self-signed")]
+        )
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(name)
+            .issuer_name(name)
+            .public_key(key.public_key())
+            .serial_number(1)
+            .not_valid_before(datetime(2000, 1, 1))
+            .not_valid_after(datetime(2019, 12, 31, 8, 0, 0))
+            .sign(key, hashes.SHA256())
+        )
+        py_cert = X509.from_cryptography(cert)
+
+        def verify_at(when: datetime) -> None:
+            store = X509Store()
+            store.add_cert(py_cert)
+            store.set_time(when)
+            X509StoreContext(store, py_cert).verify_certificate()
+
+        # A naive datetime is interpreted as UTC, which is after the
+        # certificate's ``notAfter`` and therefore expired.
+        with pytest.raises(X509StoreContextError):
+            verify_at(datetime(2019, 12, 31, 12, 0, 0))
+
+        # The same clock face with a UTC+8 offset is 04:00 UTC, which is still
+        # within the certificate's validity period.
+        verify_at(
+            datetime(
+                2019,
+                12,
+                31,
+                12,
+                0,
+                0,
+                tzinfo=timezone(timedelta(hours=8)),
+            )
+        )
+
     @pytest.mark.parametrize(
         "cafile, capath, call_cafile, call_capath",
         [

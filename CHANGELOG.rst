@@ -23,6 +23,7 @@ Changes:
 
 - Fixed a race in which an exception raised by a verify, ALPN selection, OCSP, or DTLS cookie callback for one ``Connection`` could be raised on an unrelated ``Connection`` created from the same ``Context`` and used concurrently from another thread. Exceptions from these callbacks are now tracked per ``Connection``. Discovered and reported by SecDim Security Research.
 - Fixed exceptions raised by a verify callback registered with ``Connection.set_verify`` being swallowed instead of being propagated to the caller.
+- Added ``OpenSSL.SSL.Context.set_verify_time()``, ``OpenSSL.SSL.Context.set_verify_hostname()``, and their ``OpenSSL.SSL.Connection`` counterparts to pin the certificate verification time and expected hostname before the handshake. A timezone-aware ``datetime`` is now converted to UTC (``OpenSSL.crypto.X509Store.set_time()`` received the same fix). When a handshake fails due to certificate verification, the raised ``OpenSSL.SSL.Error`` now carries ``verify_result`` and ``verify_message`` attributes in addition to its unchanged message.
 
 
 26.4.0 (2026-08-01)

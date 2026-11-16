@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import os
 import socket
 import sys
@@ -51,6 +52,7 @@ from OpenSSL.crypto import (
     PKey,
     X509Name,
     X509Store,
+    _datetime_to_time_t,
     _EllipticCurve,
     _PassphraseHelper,
     _PrivateKey,
@@ -439,11 +441,65 @@ _CRYPTOGRAPHY_MANYLINUX_CA_FILE = b"/opt/pyca/cryptography/openssl/cert.pem"
 class Error(Exception):
     """
     An error occurred in an `OpenSSL.SSL` API.
+
+    :ivar verify_result: The X.509 verification result code for the failure,
+        or ``None`` if the failure was not caused by certificate verification.
+    :ivar verify_message: A human-readable description of ``verify_result``,
+        or ``None`` if the failure was not caused by certificate verification.
     """
+
+    verify_result: int | None
+    verify_message: str | None
+
+    def __init__(self, *args: Any) -> None:
+        super().__init__(*args)
+        self.verify_result = None
+        self.verify_message = None
 
 
 _raise_current_error = partial(_exception_from_error_queue, Error)
 _openssl_assert = _make_assert(Error)
+
+
+def _raise_current_error_with_verify_result(ssl: Any) -> None:
+    """
+    Raise an :class:`Error` from the OpenSSL error queue and, if the SSL
+    object records a non-OK certificate verification result, attach that
+    result and its human-readable description to the exception.
+
+    The exception message itself is left unchanged so that existing callers
+    that match on the text of ``SSL.Error`` continue to work.
+    """
+    try:
+        _raise_current_error()
+    except Error as exc:
+        verify_result = _lib.SSL_get_verify_result(ssl)
+        if verify_result != _lib.X509_V_OK:
+            exc.verify_result = verify_result
+            exc.verify_message = _ffi.string(
+                _lib.X509_verify_cert_error_string(verify_result)
+            ).decode("utf-8")
+        raise
+
+
+def _encode_verify_hostname(hostname: str) -> bytes:
+    """
+    Validate and encode an expected verification hostname.
+
+    The hostname must be a non-empty ``str`` without embedded NUL bytes.  It
+    is encoded to ASCII using IDNA so that internationalized hostnames are
+    compared against their A-label form.
+    """
+    if not isinstance(hostname, str):
+        raise TypeError("hostname must be a string")
+    if hostname == "":
+        raise ValueError("hostname must not be empty")
+    if "\0" in hostname:
+        raise ValueError("hostname must not contain NUL bytes")
+    try:
+        return hostname.encode("idna")
+    except UnicodeError:
+        raise ValueError(f"{hostname!r} is not a valid hostname")
 
 
 class WantReadError(Error):
@@ -1399,6 +1455,54 @@ class Context:
         return _lib.SSL_CTX_get_verify_depth(self._context)
 
     @_require_not_used
+    def set_verify_time(self, vfy_time: datetime.datetime) -> None:
+        """
+        Set the time against which the peer's certificates are verified.
+
+        Normally the current time is used.  This is useful for checking
+        whether a certificate was valid at a given time in the past or will
+        be valid at a given time in the future.
+
+        If *vfy_time* is timezone-aware it is converted to UTC.  Naive
+        datetimes are interpreted as UTC.  Calling this method again replaces
+        the previously set verification time.
+
+        .. versionadded:: 26.4.1
+
+        :param vfy_time: The verification time to set on this context.
+        :return: None
+        """
+        if not isinstance(vfy_time, datetime.datetime):
+            raise TypeError("vfy_time must be a datetime")
+
+        param = _lib.SSL_CTX_get0_param(self._context)
+        _lib.X509_VERIFY_PARAM_set_time(param, _datetime_to_time_t(vfy_time))
+
+    @_require_not_used
+    def set_verify_hostname(self, hostname: str) -> None:
+        """
+        Set the hostname that the peer's certificate is expected to contain.
+
+        The hostname is checked against the ``subjectAltName`` extension of
+        the peer certificate during verification.  Calling this method again
+        replaces the previously set hostname.
+
+        .. versionadded:: 26.4.1
+
+        :param hostname: The expected hostname.
+        :return: None
+        """
+        hostname_bytes = _encode_verify_hostname(hostname)
+
+        param = _lib.SSL_CTX_get0_param(self._context)
+        _openssl_assert(
+            _lib.X509_VERIFY_PARAM_set1_host(
+                param, hostname_bytes, len(hostname_bytes)
+            )
+            == 1
+        )
+
+    @_require_not_used
     def load_tmp_dh(self, dhfile: _StrOrBytesPath) -> None:
         """
         Load parameters for Ephemeral Diffie-Hellman
@@ -2066,18 +2170,18 @@ class Connection:
             # the behavior before we added this elif section
             peeked_error = _lib.ERR_peek_error()
             reason = _lib.ERR_GET_REASON(peeked_error)
-            if _lib.Cryptography_HAS_UNEXPECTED_EOF_WHILE_READING:
-                _openssl_assert(
-                    reason == _lib.SSL_R_UNEXPECTED_EOF_WHILE_READING
-                )
+            if (
+                _lib.Cryptography_HAS_UNEXPECTED_EOF_WHILE_READING
+                and reason == _lib.SSL_R_UNEXPECTED_EOF_WHILE_READING
+            ):
                 _lib.ERR_clear_error()
                 raise SysCallError(-1, "Unexpected EOF")
             else:
-                _raise_current_error()
+                _raise_current_error_with_verify_result(ssl)
         elif error == _lib.SSL_ERROR_NONE:
             pass
         else:
-            _raise_current_error()
+            _raise_current_error_with_verify_result(ssl)
 
     def get_context(self) -> Context:
         """
@@ -2160,6 +2264,42 @@ class Connection:
         :return: The verify mode
         """
         return _lib.SSL_get_verify_mode(self._ssl)
+
+    def set_verify_time(self, vfy_time: datetime.datetime) -> None:
+        """
+        Override the verification time for this specific connection.  See
+        :meth:`Context.set_verify_time` for details.
+
+        This affects only this connection; other connections created from the
+        same :class:`Context` are not modified.
+
+        .. versionadded:: 26.4.1
+        """
+        if not isinstance(vfy_time, datetime.datetime):
+            raise TypeError("vfy_time must be a datetime")
+
+        param = _lib.SSL_get0_param(self._ssl)
+        _lib.X509_VERIFY_PARAM_set_time(param, _datetime_to_time_t(vfy_time))
+
+    def set_verify_hostname(self, hostname: str) -> None:
+        """
+        Override the expected hostname for this specific connection.  See
+        :meth:`Context.set_verify_hostname` for details.
+
+        This affects only this connection; other connections created from the
+        same :class:`Context` are not modified.
+
+        .. versionadded:: 26.4.1
+        """
+        hostname_bytes = _encode_verify_hostname(hostname)
+
+        param = _lib.SSL_get0_param(self._ssl)
+        _openssl_assert(
+            _lib.X509_VERIFY_PARAM_set1_host(
+                param, hostname_bytes, len(hostname_bytes)
+            )
+            == 1
+        )
 
     def use_certificate(self, cert: X509 | x509.Certificate) -> None:
         """

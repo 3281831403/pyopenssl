@@ -224,6 +224,19 @@ def _get_asn1_time(timestamp: Any) -> bytes | None:
         return string_result
 
 
+def _datetime_to_time_t(when: datetime.datetime) -> int:
+    """
+    Convert a :class:`datetime.datetime` to a ``time_t`` (seconds since the
+    Unix epoch).
+
+    If *when* is timezone-aware it is converted to UTC first.  Naive datetimes
+    are interpreted as UTC.
+    """
+    if when.tzinfo is not None:
+        when = when.astimezone(datetime.timezone.utc)
+    return calendar.timegm(when.timetuple())
+
+
 class _X509NameInvalidator:
     def __init__(self) -> None:
         self._names: list[X509Name] = []
@@ -1403,9 +1416,7 @@ class X509Store:
         param = _lib.X509_VERIFY_PARAM_new()
         param = _ffi.gc(param, _lib.X509_VERIFY_PARAM_free)
 
-        _lib.X509_VERIFY_PARAM_set_time(
-            param, calendar.timegm(vfy_time.timetuple())
-        )
+        _lib.X509_VERIFY_PARAM_set_time(param, _datetime_to_time_t(vfy_time))
         _openssl_assert(_lib.X509_STORE_set1_param(self._store, param) != 0)
 
     def load_locations(

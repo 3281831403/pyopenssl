@@ -4110,6 +4110,369 @@ class TestError:
         assert Error.__name__ == "Error"
 
 
+class TestVerifyTimeAndHostname:
+    """
+    Tests for ``Context``/``Connection.set_verify_time`` and
+    ``Context``/``Connection.set_verify_hostname``.
+    """
+
+    @staticmethod
+    def _build_chain(
+        *,
+        hostname: str = "example.com",
+        not_before: datetime.datetime = datetime.datetime(2000, 1, 1),
+        not_after: datetime.datetime = datetime.datetime(2099, 1, 1),
+    ) -> tuple[
+        rsa.RSAPrivateKey,
+        x509.Certificate,
+        rsa.RSAPrivateKey,
+        x509.Certificate,
+    ]:
+        """
+        Build and return ``(ca_key, ca_cert, server_key, server_cert)`` where
+        the server certificate is signed by the CA and carries *hostname* in
+        its ``subjectAltName`` extension.
+        """
+        ca_key = rsa.generate_private_key(
+            public_exponent=65537, key_size=2048
+        )
+        ca_name = x509.Name(
+            [x509.NameAttribute(NameOID.COMMON_NAME, "Test CA")]
+        )
+        ca_cert = (
+            x509.CertificateBuilder()
+            .subject_name(ca_name)
+            .issuer_name(ca_name)
+            .public_key(ca_key.public_key())
+            .serial_number(1)
+            .not_valid_before(not_before)
+            .not_valid_after(not_after)
+            .add_extension(
+                x509.BasicConstraints(ca=True, path_length=None),
+                critical=True,
+            )
+            .sign(ca_key, hashes.SHA256())
+        )
+
+        server_key = rsa.generate_private_key(
+            public_exponent=65537, key_size=2048
+        )
+        server_name = x509.Name(
+            [x509.NameAttribute(NameOID.COMMON_NAME, "server")]
+        )
+        server_cert = (
+            x509.CertificateBuilder()
+            .subject_name(server_name)
+            .issuer_name(ca_name)
+            .public_key(server_key.public_key())
+            .serial_number(2)
+            .not_valid_before(not_before)
+            .not_valid_after(not_after)
+            .add_extension(
+                x509.SubjectAlternativeName([x509.DNSName(hostname)]),
+                critical=False,
+            )
+            .sign(ca_key, hashes.SHA256())
+        )
+
+        return ca_key, ca_cert, server_key, server_cert
+
+    def _contexts(
+        self,
+        tmp_path: pathlib.Path,
+        *,
+        hostname: str = "example.com",
+        not_before: datetime.datetime = datetime.datetime(2000, 1, 1),
+        not_after: datetime.datetime = datetime.datetime(2099, 1, 1),
+    ) -> tuple[Context, Context]:
+        """
+        Write the certificate chain from :meth:`_build_chain` to ``tmp_path``
+        as PEM files and return a client context (which trusts the CA and
+        requires verification) and a server context (which presents the
+        server certificate).
+        """
+        _ca_key, ca_cert, server_key, server_cert = self._build_chain(
+            hostname=hostname,
+            not_before=not_before,
+            not_after=not_after,
+        )
+
+        (tmp_path / "ca.pem").write_bytes(
+            ca_cert.public_bytes(serialization.Encoding.PEM)
+        )
+        (tmp_path / "server.pem").write_bytes(
+            server_cert.public_bytes(serialization.Encoding.PEM)
+        )
+        (tmp_path / "server.key").write_bytes(
+            server_key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.TraditionalOpenSSL,
+                serialization.NoEncryption(),
+            )
+        )
+
+        server_context = Context(TLS_METHOD)
+        server_context.use_certificate_file(str(tmp_path / "server.pem"))
+        server_context.use_privatekey_file(str(tmp_path / "server.key"))
+
+        client_context = Context(TLS_METHOD)
+        client_context.load_verify_locations(str(tmp_path / "ca.pem"))
+        client_context.set_verify(VERIFY_PEER)
+
+        return client_context, server_context
+
+    def test_verify_hostname_success(self, tmp_path: pathlib.Path) -> None:
+        """
+        An in-memory handshake succeeds when the peer certificate contains the
+        expected hostname.
+        """
+        client_context, server_context = self._contexts(tmp_path)
+        client_context.set_verify_hostname("example.com")
+
+        client = Connection(client_context, None)
+        server = Connection(server_context, None)
+
+        handshake_in_memory(client, server)
+        assert client.get_peer_certificate() is not None
+
+    def test_verify_hostname_mismatch(self, tmp_path: pathlib.Path) -> None:
+        """
+        A hostname mismatch fails the handshake with a ``SSL.Error`` carrying
+        verify result code 62.
+        """
+        client_context, server_context = self._contexts(tmp_path)
+        client_context.set_verify_hostname("wrong.example.com")
+
+        client = Connection(client_context, None)
+        server = Connection(server_context, None)
+
+        with pytest.raises(Error) as exc:
+            handshake_in_memory(client, server)
+
+        assert exc.value.verify_result == 62
+        assert exc.value.verify_message == "hostname mismatch"
+        assert "certificate verify failed" in str(exc.value)
+
+    def test_verify_certificate_expired(self, tmp_path: pathlib.Path) -> None:
+        """
+        A certificate that is expired at the verification time fails the
+        handshake with a ``SSL.Error`` carrying verify result code 10.
+        """
+        client_context, server_context = self._contexts(tmp_path)
+        client_context.set_verify_time(
+            datetime.datetime(2099, 6, 1, 0, 0, 0)
+        )
+
+        client = Connection(client_context, None)
+        server = Connection(server_context, None)
+
+        with pytest.raises(Error) as exc:
+            handshake_in_memory(client, server)
+
+        assert exc.value.verify_result == 10
+        assert exc.value.verify_message == "certificate has expired"
+
+    def test_verify_incomplete_chain(self, tmp_path: pathlib.Path) -> None:
+        """
+        A chain whose issuer cannot be found in the trust store fails the
+        handshake with a ``SSL.Error`` carrying verify result code 20.
+        """
+        _, server_context = self._contexts(tmp_path)
+
+        client_context = Context(TLS_METHOD)
+        client_context.set_verify(VERIFY_PEER)
+
+        client = Connection(client_context, None)
+        server = Connection(server_context, None)
+
+        with pytest.raises(Error) as exc:
+            handshake_in_memory(client, server)
+
+        assert exc.value.verify_result == 20
+        assert (
+            exc.value.verify_message
+            == "unable to get local issuer certificate"
+        )
+
+    def test_verify_time_aware_datetime(self, tmp_path: pathlib.Path) -> None:
+        """
+        A timezone-aware verification time is converted to UTC before being
+        used to check certificate validity.
+        """
+        client_context, server_context = self._contexts(
+            tmp_path,
+            not_after=datetime.datetime(2019, 12, 31, 8, 0, 0),
+        )
+        # 12:00 UTC+8 is 04:00 UTC, which is within the validity period.
+        client_context.set_verify_time(
+            datetime.datetime(
+                2019,
+                12,
+                31,
+                12,
+                0,
+                0,
+                tzinfo=datetime.timezone(datetime.timedelta(hours=8)),
+            )
+        )
+
+        client = Connection(client_context, None)
+        server = Connection(server_context, None)
+
+        handshake_in_memory(client, server)
+        assert client.get_peer_certificate() is not None
+
+    def test_verify_time_naive_datetime_is_utc(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """
+        A naive verification time is interpreted as UTC.
+        """
+        client_context, server_context = self._contexts(
+            tmp_path,
+            not_after=datetime.datetime(2019, 12, 31, 8, 0, 0),
+        )
+        # 12:00 UTC is after the certificate's ``notAfter``.
+        client_context.set_verify_time(
+            datetime.datetime(2019, 12, 31, 12, 0, 0)
+        )
+
+        client = Connection(client_context, None)
+        server = Connection(server_context, None)
+
+        with pytest.raises(Error) as exc:
+            handshake_in_memory(client, server)
+
+        assert exc.value.verify_result == 10
+
+    def test_set_verify_time_last_wins(self, tmp_path: pathlib.Path) -> None:
+        """
+        Calling ``set_verify_time`` again replaces the previously set
+        verification time.
+        """
+        client_context, server_context = self._contexts(tmp_path)
+        client_context.set_verify_time(datetime.datetime(2099, 6, 1))
+        client_context.set_verify_time(datetime.datetime(2000, 6, 1))
+
+        client = Connection(client_context, None)
+        server = Connection(server_context, None)
+
+        handshake_in_memory(client, server)
+        assert client.get_peer_certificate() is not None
+
+    def test_set_verify_hostname_last_wins(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """
+        Calling ``set_verify_hostname`` again replaces the previously set
+        hostname.
+        """
+        client_context, server_context = self._contexts(tmp_path)
+        client_context.set_verify_hostname("wrong.example.com")
+        client_context.set_verify_hostname("example.com")
+
+        client = Connection(client_context, None)
+        server = Connection(server_context, None)
+
+        handshake_in_memory(client, server)
+        assert client.get_peer_certificate() is not None
+
+    def test_connection_set_verify_hostname_only_affects_itself(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """
+        ``Connection.set_verify_hostname`` only affects that connection and
+        does not modify the shared ``Context``.
+        """
+        client_context, server_context = self._contexts(tmp_path)
+        client_context.set_verify_hostname("example.com")
+
+        client = Connection(client_context, None)
+        client.set_verify_hostname("wrong.example.com")
+
+        other_client = Connection(client_context, None)
+        server = Connection(server_context, None)
+        other_server = Connection(server_context, None)
+
+        with pytest.raises(Error) as exc:
+            handshake_in_memory(client, server)
+
+        assert exc.value.verify_result == 62
+
+        # The context-level hostname still applies to other connections.
+        handshake_in_memory(other_client, other_server)
+        assert other_client.get_peer_certificate() is not None
+
+    @pytest.mark.parametrize("value", [None, "2099-01-01", 123, object()])
+    def test_context_set_verify_time_wrong_args(self, value: object) -> None:
+        """
+        ``Context.set_verify_time`` raises ``TypeError`` for non-``datetime``
+        arguments.
+        """
+        context = Context(TLS_METHOD)
+        with pytest.raises(TypeError):
+            context.set_verify_time(value)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("value", [None, "2099-01-01", 123, object()])
+    def test_connection_set_verify_time_wrong_args(
+        self, value: object
+    ) -> None:
+        """
+        ``Connection.set_verify_time`` raises ``TypeError`` for a
+        non-``datetime`` argument.
+        """
+        context = Context(TLS_METHOD)
+        connection = Connection(context, None)
+        with pytest.raises(TypeError):
+            connection.set_verify_time(value)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("value", [None, b"example.com", 123, object()])
+    def test_context_set_verify_hostname_wrong_args(
+        self, value: object
+    ) -> None:
+        """
+        ``Context.set_verify_hostname`` raises ``TypeError`` for non-``str``
+        arguments.
+        """
+        context = Context(TLS_METHOD)
+        with pytest.raises(TypeError):
+            context.set_verify_hostname(value)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("value", [None, b"example.com", 123, object()])
+    def test_connection_set_verify_hostname_wrong_args(
+        self, value: object
+    ) -> None:
+        """
+        ``Connection.set_verify_hostname`` raises ``TypeError`` for non-``str``
+        arguments.
+        """
+        context = Context(TLS_METHOD)
+        connection = Connection(context, None)
+        with pytest.raises(TypeError):
+            connection.set_verify_hostname(value)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("value", ["", "with\0null"])
+    def test_context_set_verify_hostname_illegal(self, value: str) -> None:
+        """
+        ``Context.set_verify_hostname`` rejects empty hostnames and hostnames
+        containing NUL bytes.
+        """
+        context = Context(TLS_METHOD)
+        with pytest.raises(ValueError):
+            context.set_verify_hostname(value)
+
+    @pytest.mark.parametrize("value", ["", "with\0null"])
+    def test_connection_set_verify_hostname_illegal(self, value: str) -> None:
+        """
+        ``Connection.set_verify_hostname`` rejects empty hostnames and
+        hostnames containing NUL bytes.
+        """
+        context = Context(TLS_METHOD)
+        connection = Connection(context, None)
+        with pytest.raises(ValueError):
+            connection.set_verify_hostname(value)
+
+
 class TestConstants:
     """
     Tests for the values of constants exposed in `OpenSSL.SSL`.
